@@ -58,12 +58,6 @@ def active_label() -> str:
     return f"**{providers.PROVIDERS[p]['label']}** · `{providers.provider_cfg(settings, p)['model']}`"
 
 
-def load_provider(provider):
-    cfg = providers.provider_cfg(settings, provider)
-    saved_key = settings.get("providers", {}).get(provider, {}).get("api_key", "")
-    return cfg["base_url"], saved_key, gr.Dropdown(choices=[cfg["model"]], value=cfg["model"])
-
-
 async def refresh_models(provider, url, key):
     try:
         ids = await make_backend(settings, provider, {"base_url": url, "api_key": key}).list_models()
@@ -86,7 +80,42 @@ async def save_settings_fn(provider, url, key, model, fallback, sys_prompt, temp
         status = f"✅ Saved. Connected to {providers.PROVIDERS[provider]['label']}: {info}"
     except Exception as e:  # noqa: BLE001
         status = f"Saved, but connection failed: {e}"
-    return status, active_label()
+    model_dd = gr.Dropdown(choices=[model], value=model)
+    return status, active_label(), provider, model_dd
+
+
+def _persist_model(provider, model):
+    settings.setdefault("providers", {}).setdefault(provider, {})["model"] = model
+    config.save_settings(settings)
+
+
+def pick_provider(provider):
+    """Chat-tab provider picker: applies immediately; returns updates for the chat and Settings widgets."""
+    settings["provider"] = provider
+    config.save_settings(settings)
+    cfg = providers.provider_cfg(settings, provider)
+    saved_key = settings.get("providers", {}).get(provider, {}).get("api_key", "")
+    model = gr.Dropdown(choices=[cfg["model"]], value=cfg["model"])
+    return model, active_label(), provider, cfg["base_url"], saved_key, model
+
+
+def pick_model(model):
+    if not model:
+        return gr.skip(), gr.skip(), gr.skip()
+    _persist_model(settings["provider"], model)
+    return active_label(), gr.Dropdown(value=model), gr.Dropdown(value=model)
+
+
+async def refresh_chat_models():
+    p = settings["provider"]
+    try:
+        ids = await make_backend(settings, p).list_models()
+    except Exception as e:  # noqa: BLE001
+        gr.Warning(f"Could not list models: {e}")
+        return gr.skip(), gr.skip()
+    cur = providers.provider_cfg(settings, p)["model"]
+    dd = gr.Dropdown(choices=ids, value=cur)
+    return dd, dd
 
 
 def skill_rows():
@@ -137,6 +166,13 @@ def build() -> gr.Blocks:
             theme_btn = gr.Button("🌓 Theme", size="sm", scale=0, min_width=100, elem_id="theme-btn")
             theme_btn.click(None, js=TOGGLE_JS)
         with gr.Tab("Chat"):
+            with gr.Row():
+                chat_provider = gr.Dropdown(providers.choices(), value=settings["provider"], label="Provider",
+                                            scale=2, interactive=True)
+                chat_model = gr.Dropdown([providers.provider_cfg(settings, settings["provider"])["model"]],
+                                         value=providers.provider_cfg(settings, settings["provider"])["model"],
+                                         allow_custom_value=True, label="Model", scale=4, interactive=True)
+                chat_refresh = gr.Button("🔄", scale=0, min_width=50)
             bot = gr.Chatbot(height=560, placeholder="Say something…")
             box = gr.Textbox(placeholder="Message (Enter to send)", show_label=False, autofocus=True)
             with gr.Row():
@@ -177,10 +213,16 @@ def build() -> gr.Blocks:
                 iters = gr.Slider(1, 30, s["max_tool_iterations"], step=1, label="Max tool iterations")
             save = gr.Button("Save & test connection", variant="primary")
             status = gr.Markdown()
-            provider.change(load_provider, provider, [url, key, model])
             refresh.click(refresh_models, [provider, url, key], model)
             save.click(save_settings_fn, [provider, url, key, model, fallback, sysp, temp, top_p, top_k, min_p,
-                                          rep, maxt, iters], [status, active_md])
+                                          rep, maxt, iters], [status, active_md, chat_provider, chat_model])
+            # Chat-tab picker <-> Settings tab stay in sync. (.input fires only on user edits, so
+            # programmatic updates from the other tab don't loop.)
+            chat_provider.input(pick_provider, chat_provider, [chat_model, active_md, provider, url, key, model])
+            chat_model.input(pick_model, chat_model, [active_md, model, chat_model])
+            chat_refresh.click(refresh_chat_models, None, [chat_model, model])
+            provider.input(pick_provider, provider, [chat_model, active_md, chat_provider, url, key, model])
+            model.input(pick_model, model, [active_md, chat_model, model])
 
         with gr.Tab("MCP"):
             gr.Markdown('Claude-Desktop-style config. stdio: `{"command","args","env"}`; remote: `{"url","headers"}`.')
