@@ -1,0 +1,20 @@
+[project]
+name = "llmui"
+version = "0.1.0"
+description = "Gradio chat UI for KoboldCpp with MCP servers and skills"
+requires-python = ">=3.10"
+dependencies = ["gradio>=5", "openai>=1.50", "mcp>=2.0", "pyyaml>=6"]
+
+[dependency-groups]
+dev = ["pytest", "pytest-asyncio"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["llmui"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
