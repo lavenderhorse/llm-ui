@@ -5,7 +5,6 @@ import json
 import time
 
 from . import skills as skills_mod
-from .backend import Backend
 from .mcp_manager import MCPManager
 
 
@@ -14,7 +13,7 @@ def build_messages(settings: dict, skills: dict, convo: list[dict]) -> list[dict
     return [{"role": "system", "content": system}] + convo
 
 
-async def run_turn(backend: Backend, mcp: MCPManager, skills: dict, settings: dict,
+async def run_turn(backend, mcp: MCPManager, skills: dict, settings: dict,
                    convo: list[dict], display: list[dict]):
     """Async generator. Mutates `convo` (OpenAI format) and `display` (Gradio messages),
     yielding after every visible change."""
@@ -23,6 +22,7 @@ async def run_turn(backend: Backend, mcp: MCPManager, skills: dict, settings: di
         display.append({"role": "assistant", "content": ""})
         msg = display[-1]
         calls: list[dict] = []
+        meta: dict = {}  # provider-specific data to keep on the assistant turn (thinking blocks etc.)
         text = ""
         try:
             try:
@@ -31,6 +31,8 @@ async def run_turn(backend: Backend, mcp: MCPManager, skills: dict, settings: di
                         text += val
                         msg["content"] = text
                         yield
+                    elif kind == "meta":
+                        meta.update(val)
                     else:
                         calls = val
             except Exception:
@@ -45,6 +47,8 @@ async def run_turn(backend: Backend, mcp: MCPManager, skills: dict, settings: di
                         text += val
                         msg["content"] = text
                         yield
+                    elif kind == "meta":
+                        meta.update(val)
         except Exception as e:  # noqa: BLE001
             msg["content"] = (text + f"\n\n⚠️ Backend error: {e}").strip()
             yield
@@ -53,12 +57,12 @@ async def run_turn(backend: Backend, mcp: MCPManager, skills: dict, settings: di
             if not text:
                 display.pop()
             else:
-                convo.append({"role": "assistant", "content": text})
+                convo.append({"role": "assistant", "content": text, **meta})
             yield
             return
         if not text:
             display.pop()
-        convo.append({"role": "assistant", "content": text or None, "tool_calls": [
+        convo.append({"role": "assistant", "content": text or None, **meta, "tool_calls": [
             {"id": c["id"], "type": "function", "function": {"name": c["name"], "arguments": c["arguments"] or "{}"}}
             for c in calls]})
         for c in calls:
@@ -71,7 +75,9 @@ async def run_turn(backend: Backend, mcp: MCPManager, skills: dict, settings: di
             display.append(block)
             yield
             t0 = time.time()
-            if args is None:
+            if c.get("error"):
+                result = f"Error: {c['error']}"
+            elif args is None:
                 result = "Error: tool arguments were not valid JSON."
             elif skills_mod.is_skill_tool(c["name"]):
                 result = skills_mod.call_tool(skills, c["name"], args)

@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import gradio as gr
 
-from . import config, skills as skills_mod
+from . import config, providers, skills as skills_mod
 from .agent import run_turn
-from .backend import Backend
+from .backend import active_settings, make_backend
 from .mcp_manager import MCPManager
 
 mcp = MCPManager()
@@ -34,7 +34,7 @@ async def chat(user_text, display, convo):
     display = display + [{"role": "user", "content": user_text}]
     convo = convo + [{"role": "user", "content": user_text}]
     yield display, convo, ""
-    async for _ in run_turn(Backend(settings["base_url"]), mcp, enabled_skills(), settings, convo, display):
+    async for _ in run_turn(make_backend(settings), mcp, enabled_skills(), active_settings(settings), convo, display):
         yield display, convo, ""
     yield display, convo, ""
 
@@ -48,19 +48,45 @@ async def regenerate(display, convo):
     if not convo:
         yield display, convo
         return
-    async for _ in run_turn(Backend(settings["base_url"]), mcp, enabled_skills(), settings, convo, display):
+    async for _ in run_turn(make_backend(settings), mcp, enabled_skills(), active_settings(settings), convo, display):
         yield display, convo
     yield display, convo
 
 
-async def save_settings_fn(url, model, sys_prompt, temp, top_p, top_k, min_p, rep_pen, max_tokens, max_iter):
-    settings.update(base_url=url, model=model, system_prompt=sys_prompt, temperature=temp, top_p=top_p,
-                    top_k=top_k, min_p=min_p, rep_pen=rep_pen, max_tokens=max_tokens, max_tool_iterations=max_iter)
+def active_label() -> str:
+    p = settings["provider"]
+    return f"**{providers.PROVIDERS[p]['label']}** · `{providers.provider_cfg(settings, p)['model']}`"
+
+
+def load_provider(provider):
+    cfg = providers.provider_cfg(settings, provider)
+    saved_key = settings.get("providers", {}).get(provider, {}).get("api_key", "")
+    return cfg["base_url"], saved_key, gr.Dropdown(choices=[cfg["model"]], value=cfg["model"])
+
+
+async def refresh_models(provider, url, key):
+    try:
+        ids = await make_backend(settings, provider, {"base_url": url, "api_key": key}).list_models()
+    except Exception as e:  # noqa: BLE001
+        gr.Warning(f"Could not list models: {e}")
+        return gr.Dropdown()
+    cur = providers.provider_cfg(settings, provider)["model"]
+    return gr.Dropdown(choices=ids, value=cur if cur in ids else (ids[0] if ids else None))
+
+
+async def save_settings_fn(provider, url, key, model, fallback, sys_prompt, temp, top_p, top_k, min_p,
+                           rep_pen, max_tokens, max_iter):
+    settings.update(provider=provider, claude_fallback=fallback, system_prompt=sys_prompt, temperature=temp,
+                    top_p=top_p, top_k=top_k, min_p=min_p, rep_pen=rep_pen, max_tokens=max_tokens,
+                    max_tool_iterations=max_iter)
+    settings.setdefault("providers", {})[provider] = {"base_url": url, "api_key": key, "model": model}
     config.save_settings(settings)
     try:
-        return f"✅ Saved. Connected to model: {await Backend(url).ping()}"
+        info = await make_backend(settings).ping()
+        status = f"✅ Saved. Connected to {providers.PROVIDERS[provider]['label']}: {info}"
     except Exception as e:  # noqa: BLE001
-        return f"Saved, but connection failed: {e}"
+        status = f"Saved, but connection failed: {e}"
+    return status, active_label()
 
 
 def skill_rows():
@@ -103,10 +129,11 @@ TOGGLE_JS = """
 
 
 def build() -> gr.Blocks:
-    with gr.Blocks(title="KoboldCpp Chat") as demo:
+    with gr.Blocks(title="LLM Chat") as demo:
         convo = gr.State([])
         with gr.Row():
-            gr.Markdown("### KoboldCpp Chat")
+            gr.Markdown("### LLM Chat")
+            active_md = gr.Markdown(active_label())
             theme_btn = gr.Button("🌓 Theme", size="sm", scale=0, min_width=100, elem_id="theme-btn")
             theme_btn.click(None, js=TOGGLE_JS)
         with gr.Tab("Chat"):
@@ -125,9 +152,20 @@ def build() -> gr.Blocks:
 
         with gr.Tab("Settings"):
             s = settings
-            url = gr.Textbox(s["base_url"], label="KoboldCpp URL")
-            model = gr.Textbox(s["model"], label="Model name (sent to API)")
+            cfg = providers.provider_cfg(s, s["provider"])
+            provider = gr.Dropdown(providers.choices(), value=s["provider"], label="Provider")
+            with gr.Row():
+                url = gr.Textbox(cfg["base_url"], label="Base URL", scale=2)
+                key = gr.Textbox(s.get("providers", {}).get(s["provider"], {}).get("api_key", ""), type="password",
+                                 label="API key (blank = use env var, e.g. OPENAI_API_KEY)", scale=2)
+            with gr.Row():
+                model = gr.Dropdown([cfg["model"]], value=cfg["model"], allow_custom_value=True,
+                                    label="Model (type any id, or refresh the list)", scale=3)
+                refresh = gr.Button("🔄 Refresh models", scale=1)
+            fallback = gr.Checkbox(s["claude_fallback"], label="Claude: enable server-side refusal fallback (beta)")
             sysp = gr.Textbox(s["system_prompt"], label="System prompt", lines=4)
+            gr.Markdown("_Sampling: top-k / min-p / repetition penalty apply to KoboldCpp only; "
+                        "Claude ignores all sampling controls._")
             with gr.Row():
                 temp = gr.Slider(0, 2, s["temperature"], step=0.05, label="Temperature")
                 top_p = gr.Slider(0, 1, s["top_p"], step=0.01, label="Top P")
@@ -139,7 +177,10 @@ def build() -> gr.Blocks:
                 iters = gr.Slider(1, 30, s["max_tool_iterations"], step=1, label="Max tool iterations")
             save = gr.Button("Save & test connection", variant="primary")
             status = gr.Markdown()
-            save.click(save_settings_fn, [url, model, sysp, temp, top_p, top_k, min_p, rep, maxt, iters], status)
+            provider.change(load_provider, provider, [url, key, model])
+            refresh.click(refresh_models, [provider, url, key], model)
+            save.click(save_settings_fn, [provider, url, key, model, fallback, sysp, temp, top_p, top_k, min_p,
+                                          rep, maxt, iters], [status, active_md])
 
         with gr.Tab("MCP"):
             gr.Markdown('Claude-Desktop-style config. stdio: `{"command","args","env"}`; remote: `{"url","headers"}`.')
